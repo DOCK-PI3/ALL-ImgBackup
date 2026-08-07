@@ -1,0 +1,7 @@
+/target/
+*.img
+*.img.part
+*.log
+.idea/
+.vscode/
+

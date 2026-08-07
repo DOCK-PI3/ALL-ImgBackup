@@ -1,0 +1,36 @@
+[package]
+name = "all-imgbackup"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+description = "Aplicación de escritorio nativa para crear y restaurar imágenes de discos"
+license = "MIT"
+
+[[bin]]
+name = "ALL-ImgBackup"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.36.0", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "pollster"] }
+sha2 = "0.10.9"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.175"
+
+[build-dependencies]
+embed-resource = "3.0.11"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

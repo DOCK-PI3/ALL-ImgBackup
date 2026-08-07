@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ALL ImgBackup
+Comment=Crear y restaurar imágenes RAW de discos
+Exec=pkexec ALL-ImgBackup
+Icon=all-imgbackup
+Terminal=false
+Categories=System;Utility;
+Keywords=SD;USB;disk;image;backup;restore;
+
