@@ -2,7 +2,7 @@ use crate::devices::DeviceInfo;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, BufWriter, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -13,7 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const BUFFER_SIZE: usize = 512 * 1024;
+const MIN_RETRY_SIZE: usize = 64 * 1024;
+const READ_RETRIES: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
@@ -57,16 +59,11 @@ pub enum JobEvent {
 pub fn spawn(spec: JobSpec, cancel: Arc<AtomicBool>, sender: Sender<JobEvent>) {
     thread::spawn(move || {
         let started = Instant::now();
-        let result = match spec.kind {
+        let result = revalidate_device(&spec, &cancel).and_then(|()| match spec.kind {
             JobKind::Backup => backup(&spec, &cancel, &sender),
             JobKind::Restore => restore(&spec, &cancel, &sender),
-        };
+        });
         match result {
-            Ok((bytes, hash)) if cancel.load(Ordering::Relaxed) => {
-                let _ = sender.send(JobEvent::Cancelled);
-                let _ = bytes;
-                let _ = hash;
-            }
             Ok((bytes, hash)) => {
                 let _ = sender.send(JobEvent::Finished {
                     bytes,
@@ -74,9 +71,10 @@ pub fn spawn(spec: JobSpec, cancel: Arc<AtomicBool>, sender: Sender<JobEvent>) {
                     elapsed: started.elapsed(),
                 });
             }
-            Err(error) if cancel.load(Ordering::Relaxed) => {
+            Err(error)
+                if error.kind() == io::ErrorKind::Interrupted && cancel.load(Ordering::Relaxed) =>
+            {
                 let _ = sender.send(JobEvent::Cancelled);
-                let _ = error;
             }
             Err(error) => {
                 let _ = sender.send(JobEvent::Failed(friendly_error(&error, spec.kind)));
@@ -85,63 +83,87 @@ pub fn spawn(spec: JobSpec, cancel: Arc<AtomicBool>, sender: Sender<JobEvent>) {
     });
 }
 
+fn revalidate_device(spec: &JobSpec, cancel: &AtomicBool) -> io::Result<()> {
+    check_cancel(cancel)?;
+    let devices = crate::devices::scan()
+        .map_err(|error| io_context("no se pudieron comprobar los dispositivos", error))?;
+    if spec.device.system || !devices.contains(&spec.device) {
+        return Err(io::Error::other(
+            "el dispositivo cambió o dejó de estar disponible. Actualiza la lista y vuelve a seleccionarlo",
+        ));
+    }
+    if path_is_on_device(&spec.image, &spec.device) {
+        return Err(io::Error::other(
+            "el archivo de imagen está en el mismo dispositivo seleccionado",
+        ));
+    }
+    check_cancel(cancel)
+}
+
 fn backup(
     spec: &JobSpec,
     cancel: &AtomicBool,
     sender: &Sender<JobEvent>,
 ) -> io::Result<(u64, String)> {
     sender.send(JobEvent::Stage(Stage::Preparing)).ok();
-    let source = open_device_read(&spec.device.path)?;
+    check_cancel(cancel)?;
     let partial = partial_path(&spec.image);
     let output = OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
+        .read(spec.verify)
         .write(true)
-        .open(&partial)?;
+        .open(&partial)
+        .map_err(|error| {
+            io_context(
+                &format!("no se pudo crear el archivo temporal {}", partial.display()),
+                error,
+            )
+        })?;
 
-    sender.send(JobEvent::Stage(Stage::Copying)).ok();
-    let mut reader = BufReader::with_capacity(BUFFER_SIZE, source);
-    let mut writer = BufWriter::with_capacity(BUFFER_SIZE, output);
-    let copy_result = copy_exact(
-        &mut reader,
-        &mut writer,
-        spec.device.capacity,
-        cancel,
-        sender,
-    );
+    let result = (|| {
+        let mut output = output;
+        let (bytes, source_hash) = {
+            #[cfg(windows)]
+            let _volume_locks = lock_windows_volumes(&spec.device, false)?;
+            let source = open_device_read(&spec.device.path).map_err(|error| {
+                io_context(&format!("no se pudo abrir {}", spec.device.path), error)
+            })?;
+            sender.send(JobEvent::Stage(Stage::Copying)).ok();
+            copy_exact(source, &mut output, spec.device.capacity, cancel, sender)
+                .map_err(|error| io_context("copia de la unidad a la imagen", error))?
+        };
+        sender.send(JobEvent::Stage(Stage::Flushing)).ok();
+        output
+            .sync_all()
+            .map_err(|error| io_context("sincronización de la imagen", error))?;
 
-    let (bytes, source_hash) = match copy_result {
-        Ok(value) => {
-            writer.flush()?;
-            writer.get_ref().sync_all()?;
-            value
+        if spec.verify {
+            sender.send(JobEvent::Stage(Stage::Verifying)).ok();
+            output.seek(SeekFrom::Start(0))?;
+            let image_hash = hash_reader(&mut output, bytes, cancel, sender)
+                .map_err(|error| io_context("verificación de la imagen", error))?;
+            if image_hash != source_hash {
+                return Err(io::Error::other("la verificación SHA-256 no coincide"));
+            }
         }
-        Err(error) => {
-            drop(writer);
-            drop(fs::remove_file(&partial));
-            return Err(error);
-        }
-    };
-    drop(writer);
-    if cancel.load(Ordering::Relaxed) {
-        drop(fs::remove_file(&partial));
-        return Ok((bytes, source_hash));
-    }
+        drop(output);
+        check_cancel(cancel)?;
+        // The temporary file is next to the final image, so replacement uses a single rename.
+        fs::rename(&partial, &spec.image)
+            .map_err(|error| io_context("no se pudo guardar la imagen final", error))?;
+        Ok((bytes, source_hash))
+    })();
 
-    if spec.verify {
-        sender.send(JobEvent::Stage(Stage::Verifying)).ok();
-        let image_hash = hash_file(&partial, bytes, cancel, sender)?;
-        if image_hash != source_hash {
-            drop(fs::remove_file(&partial));
-            return Err(io::Error::other("la verificación SHA-256 no coincide"));
-        }
+    if let Err(error) = &result
+        && let Err(cleanup_error) = fs::remove_file(&partial)
+        && cleanup_error.kind() != io::ErrorKind::NotFound
+    {
+        return Err(io::Error::other(format!(
+            "{error}. No se pudo eliminar {} ({cleanup_error})",
+            partial.display()
+        )));
     }
-
-    if spec.image.exists() {
-        fs::remove_file(&spec.image)?;
-    }
-    fs::rename(&partial, &spec.image)?;
-    Ok((bytes, source_hash))
+    result
 }
 
 fn restore(
@@ -150,7 +172,14 @@ fn restore(
     sender: &Sender<JobEvent>,
 ) -> io::Result<(u64, String)> {
     sender.send(JobEvent::Stage(Stage::Preparing)).ok();
-    let image_size = fs::metadata(&spec.image)?.len();
+    let source = File::open(&spec.image)?;
+    let image_size = source.metadata()?.len();
+    if image_size == 0 || !image_size.is_multiple_of(512) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "la imagen está vacía o su tamaño no está alineado a sectores de 512 bytes",
+        ));
+    }
     if image_size > spec.device.capacity {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -158,15 +187,17 @@ fn restore(
         ));
     }
 
-    let source = File::open(&spec.image)?;
-    let mut target = open_device_write(&spec.device.path)?;
-    sender.send(JobEvent::Stage(Stage::Copying)).ok();
-    let mut reader = BufReader::with_capacity(BUFFER_SIZE, source);
-    let (bytes, image_hash) = copy_exact(&mut reader, &mut target, image_size, cancel, sender)?;
-
-    if cancel.load(Ordering::Relaxed) {
-        return Ok((bytes, image_hash));
+    #[cfg(target_os = "linux")]
+    if spec.device.mounted {
+        return Err(io::Error::other(
+            "desmonta primero el dispositivo de destino",
+        ));
     }
+    check_cancel(cancel)?;
+    let mut target = open_device_write(&spec.device)?;
+    sender.send(JobEvent::Stage(Stage::Copying)).ok();
+    let (bytes, image_hash) = copy_exact(source, &mut target, image_size, cancel, sender)
+        .map_err(|error| io_context("copia de la imagen al dispositivo", error))?;
 
     sender.send(JobEvent::Stage(Stage::Flushing)).ok();
     target.flush()?;
@@ -185,7 +216,7 @@ fn restore(
     Ok((bytes, image_hash))
 }
 
-fn copy_exact<R: Read, W: Write>(
+fn copy_exact<R: Read + Seek, W: Write>(
     mut reader: R,
     mut writer: W,
     total: u64,
@@ -198,16 +229,16 @@ fn copy_exact<R: Read, W: Write>(
     let started = Instant::now();
     let mut last_update = Instant::now();
 
-    while processed < total && !cancel.load(Ordering::Relaxed) {
+    while processed < total {
         let remaining = (total - processed).min(buffer.len() as u64) as usize;
-        let count = reader.read(&mut buffer[..remaining])?;
-        if count == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!("lectura incompleta: {processed} de {total} bytes"),
-            ));
-        }
-        writer.write_all(&buffer[..count])?;
+        let count = read_chunk(&mut reader, &mut buffer[..remaining], processed, cancel)?;
+        check_cancel(cancel)?;
+        writer.write_all(&buffer[..count]).map_err(|error| {
+            io_context(
+                &format!("falló la escritura del bloque desde el byte {processed}"),
+                error,
+            )
+        })?;
         hasher.update(&buffer[..count]);
         processed += count as u64;
         if last_update.elapsed() >= Duration::from_millis(120) || processed == total {
@@ -215,20 +246,79 @@ fn copy_exact<R: Read, W: Write>(
             last_update = Instant::now();
         }
     }
-    writer.flush()?;
+    check_cancel(cancel)?;
     Ok((processed, format!("{:x}", hasher.finalize())))
 }
 
-fn hash_file(
-    path: &Path,
-    total: u64,
+fn read_chunk(
+    reader: &mut (impl Read + Seek),
+    buffer: &mut [u8],
+    offset: u64,
     cancel: &AtomicBool,
-    sender: &Sender<JobEvent>,
-) -> io::Result<String> {
-    hash_reader(File::open(path)?, total, cancel, sender)
+) -> io::Result<usize> {
+    let mut wanted = buffer.len();
+    for attempt in 0..=READ_RETRIES {
+        check_cancel(cancel)?;
+        match reader.read(&mut buffer[..wanted]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("la lectura terminó antes de tiempo en el byte {offset}"),
+                ));
+            }
+            Ok(count) => return Ok(count),
+            Err(error) if attempt < READ_RETRIES && retryable_read_error(&error) => {
+                reader.seek(SeekFrom::Start(offset)).map_err(|error| {
+                    io_context(
+                        &format!("no se pudo retomar la lectura en el byte {offset}"),
+                        error,
+                    )
+                })?;
+                // Keep requests sector-aligned while reducing the transfer size after an I/O error.
+                wanted = wanted.min((wanted / 2).next_multiple_of(4096).max(MIN_RETRY_SIZE));
+            }
+            Err(error) => {
+                return Err(io_context(
+                    &format!(
+                        "falló la lectura del bloque desde el byte {offset} ({wanted} bytes, {} intento(s))",
+                        attempt + 1
+                    ),
+                    error,
+                ));
+            }
+        }
+    }
+    unreachable!("each final attempt returns a result")
 }
 
-fn hash_reader<R: Read>(
+fn retryable_read_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{ERROR_CRC, ERROR_IO_DEVICE, ERROR_SEM_TIMEOUT};
+        if error.raw_os_error().is_some_and(|code| {
+            matches!(code as u32, ERROR_CRC | ERROR_IO_DEVICE | ERROR_SEM_TIMEOUT)
+        }) {
+            return true;
+        }
+    }
+    error.kind() == io::ErrorKind::Interrupted
+}
+
+fn check_cancel(cancel: &AtomicBool) -> io::Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "operación cancelada",
+        ));
+    }
+    Ok(())
+}
+
+fn io_context(action: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{action} ({error})"))
+}
+
+fn hash_reader<R: Read + Seek>(
     mut reader: R,
     total: u64,
     cancel: &AtomicBool,
@@ -239,15 +329,9 @@ fn hash_reader<R: Read>(
     let mut processed = 0u64;
     let started = Instant::now();
     let mut last_update = Instant::now();
-    while processed < total && !cancel.load(Ordering::Relaxed) {
+    while processed < total {
         let remaining = (total - processed).min(buffer.len() as u64) as usize;
-        let count = reader.read(&mut buffer[..remaining])?;
-        if count == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "lectura incompleta",
-            ));
-        }
+        let count = read_chunk(&mut reader, &mut buffer[..remaining], processed, cancel)?;
         hasher.update(&buffer[..count]);
         processed += count as u64;
         if last_update.elapsed() >= Duration::from_millis(120) || processed == total {
@@ -255,6 +339,7 @@ fn hash_reader<R: Read>(
             last_update = Instant::now();
         }
     }
+    check_cancel(cancel)?;
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -286,19 +371,15 @@ fn open_device_read(path: &str) -> io::Result<File> {
 }
 
 #[cfg(windows)]
-fn open_device_write(path: &str) -> io::Result<DeviceWriter> {
+fn open_device_write(device: &DeviceInfo) -> io::Result<DeviceWriter> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-    let disk_index = path
-        .rsplit_once("PhysicalDrive")
-        .and_then(|(_, value)| value.parse::<u32>().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ruta de disco no válida"))?;
-    let volume_locks = lock_windows_volumes(disk_index)?;
+    let volume_locks = lock_windows_volumes(device, true)?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .open(path)?;
+        .open(&device.path)?;
     Ok(DeviceWriter {
         file,
         _volume_locks: volume_locks,
@@ -311,9 +392,12 @@ fn open_device_read(path: &str) -> io::Result<File> {
 }
 
 #[cfg(not(windows))]
-fn open_device_write(path: &str) -> io::Result<DeviceWriter> {
+fn open_device_write(device: &DeviceInfo) -> io::Result<DeviceWriter> {
     Ok(DeviceWriter {
-        file: OpenOptions::new().read(true).write(true).open(path)?,
+        file: OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&device.path)?,
     })
 }
 
@@ -340,7 +424,7 @@ impl Write for DeviceWriter {
 }
 
 #[cfg(windows)]
-fn lock_windows_volumes(disk_index: u32) -> io::Result<Vec<File>> {
+fn lock_windows_volumes(device: &DeviceInfo, writable: bool) -> io::Result<Vec<File>> {
     use std::{
         ffi::c_void,
         mem,
@@ -374,6 +458,7 @@ fn lock_windows_volumes(disk_index: u32) -> io::Result<Vec<File>> {
     fn control<T: Default>(file: &File, code: u32) -> io::Result<T> {
         let mut output = T::default();
         let mut returned = 0u32;
+        // The output buffer and returned-byte count live for the synchronous call.
         let ok = unsafe {
             DeviceIoControl(
                 file.as_raw_handle(),
@@ -395,6 +480,7 @@ fn lock_windows_volumes(disk_index: u32) -> io::Result<Vec<File>> {
 
     fn control_no_output(file: &File, code: u32) -> io::Result<()> {
         let mut returned = 0u32;
+        // These control codes have no input or output buffer.
         let ok = unsafe {
             DeviceIoControl(
                 file.as_raw_handle(),
@@ -414,39 +500,41 @@ fn lock_windows_volumes(disk_index: u32) -> io::Result<Vec<File>> {
         }
     }
 
-    let mut matching = Vec::new();
-    for letter in b'A'..=b'Z' {
-        let volume_path = format!(r"\\.\{}:", letter as char);
-        let Ok(file) = OpenOptions::new()
+    let mut locked = Vec::new();
+    if device.mount_points.is_empty() {
+        return Ok(locked);
+    }
+    let disk_index = device
+        .path
+        .rsplit_once("PhysicalDrive")
+        .and_then(|(_, value)| value.parse::<u32>().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ruta de disco no válida"))?;
+    for mount in &device.mount_points {
+        let volume = mount.trim_end_matches('\\');
+        let volume_path = format!(r"\\.\{volume}");
+        let file = OpenOptions::new()
             .read(true)
-            .write(true)
+            .write(writable)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .open(&volume_path)
-        else {
-            continue;
-        };
-        let Ok(extents) = control::<VolumeExtents>(&file, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS)
-        else {
-            continue;
-        };
-        if extents.extent.disk_number == disk_index {
-            matching.push((letter as char, file));
+            .map_err(|error| io_context(&format!("no se pudo abrir el volumen {volume}"), error))?;
+        let extents = control::<VolumeExtents>(&file, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS)
+            .map_err(|error| {
+                io_context(&format!("no se pudo comprobar el volumen {volume}"), error)
+            })?;
+        if extents.count != 1 || extents.extent.disk_number != disk_index {
+            return Err(io::Error::other(format!(
+                "cambió el dispositivo del volumen {volume}"
+            )));
         }
-    }
-
-    let mut locked = Vec::new();
-    for (letter, file) in matching {
         control_no_output(&file, FSCTL_LOCK_VOLUME).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("no se pudo bloquear el volumen {letter}: ({error})"),
+            io_context(
+                &format!("no se pudo bloquear el volumen {volume}. Cierra las ventanas y los programas que lo estén usando"),
+                error,
             )
         })?;
         control_no_output(&file, FSCTL_DISMOUNT_VOLUME).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("no se pudo desmontar el volumen {letter}: ({error})"),
-            )
+            io_context(&format!("no se pudo desmontar el volumen {volume}"), error)
         })?;
         locked.push(file);
     }
@@ -454,23 +542,39 @@ fn lock_windows_volumes(disk_index: u32) -> io::Result<Vec<File>> {
 }
 
 fn friendly_error(error: &io::Error, kind: JobKind) -> String {
-    match error.kind() {
-        io::ErrorKind::PermissionDenied => {
+    let action = match kind {
+        JobKind::Backup => "crear la imagen",
+        JobKind::Restore => "restaurar la imagen",
+    };
+    format!("No se pudo {action}: {error}")
+}
+
+pub fn path_is_on_device(path: &Path, device: &DeviceInfo) -> bool {
+    let parent = path.parent().unwrap_or(path);
+    let normalized_parent = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+    let normalized_file = path.canonicalize().ok();
+    device.mount_points.iter().any(|mount| {
+        let mount = Path::new(mount);
+        let mount = mount.canonicalize().unwrap_or_else(|_| mount.to_path_buf());
+        [
+            Some(normalized_parent.as_path()),
+            normalized_file.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|candidate| {
             if cfg!(windows) {
-                "Permiso denegado. Cierra la aplicación y ejecútala como administrador.".into()
+                candidate
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .starts_with(&mount.to_string_lossy().to_ascii_lowercase())
             } else {
-                "Permiso denegado. Ejecuta ALL ImgBackup con sudo o configura permisos udev.".into()
+                candidate.starts_with(&mount)
             }
-        }
-        _ => format!(
-            "No se pudo {}: {error}",
-            if kind == JobKind::Backup {
-                "crear la imagen"
-            } else {
-                "restaurar la imagen"
-            }
-        ),
-    }
+        })
+    })
 }
 
 pub fn image_size(path: &Path) -> Option<u64> {
@@ -489,6 +593,7 @@ pub fn estimate_remaining(processed: u64, total: u64, speed: f64) -> Option<Dura
 mod tests {
     use super::*;
     use std::{
+        io::Cursor,
         sync::mpsc,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -499,11 +604,68 @@ mod tests {
         let mut output = Vec::new();
         let cancel = AtomicBool::new(false);
         let (sender, _) = mpsc::channel();
-        let (bytes, hash) = copy_exact(&data[..], &mut output, data.len() as u64, &cancel, &sender)
-            .expect("copy should work");
+        let (bytes, hash) = copy_exact(
+            Cursor::new(&data),
+            &mut output,
+            data.len() as u64,
+            &cancel,
+            &sender,
+        )
+        .expect("copy should work");
         assert_eq!(bytes, data.len() as u64);
         assert_eq!(data, output);
         assert_eq!(hash.len(), 64);
+    }
+
+    struct RetryReader {
+        inner: Cursor<Vec<u8>>,
+        requests: Vec<(u64, usize)>,
+    }
+
+    impl Read for RetryReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.requests.push((self.inner.position(), buffer.len()));
+            if self.requests.len() == 1 {
+                self.inner.set_position(self.inner.position() + 512);
+                #[cfg(windows)]
+                return Err(io::Error::from_raw_os_error(23));
+                #[cfg(not(windows))]
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.inner.read(buffer)
+        }
+    }
+
+    impl Seek for RetryReader {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    #[test]
+    fn retries_from_the_same_offset_with_a_smaller_transfer() {
+        let data = (0..(BUFFER_SIZE + 512))
+            .map(|i| i as u8)
+            .collect::<Vec<_>>();
+        let mut reader = RetryReader {
+            inner: Cursor::new(data.clone()),
+            requests: Vec::new(),
+        };
+        let mut output = Vec::new();
+        let (sender, _) = mpsc::channel();
+        copy_exact(
+            &mut reader,
+            &mut output,
+            data.len() as u64,
+            &AtomicBool::new(false),
+            &sender,
+        )
+        .expect("transient read error must be recoverable");
+        assert_eq!(
+            reader.requests[..2],
+            [(0, BUFFER_SIZE), (0, BUFFER_SIZE / 2)]
+        );
+        assert_eq!(output, data);
     }
 
     #[test]
@@ -529,7 +691,7 @@ mod tests {
         let image = directory.join("backup.img");
         let data: Vec<u8> = (0..512 * 16).map(|index| (index % 251) as u8).collect();
         fs::write(&source, &data).expect("source data");
-        let spec = JobSpec {
+        let mut spec = JobSpec {
             kind: JobKind::Backup,
             device: DeviceInfo {
                 id: "test".into(),
@@ -549,11 +711,41 @@ mod tests {
         };
         let cancel = AtomicBool::new(false);
         let (sender, _) = mpsc::channel();
+        let partial = partial_path(&image);
+        fs::write(&image, b"previous image").expect("previous image");
+
+        fs::write(&partial, b"another backup").expect("existing partial");
+        assert_eq!(
+            backup(&spec, &cancel, &sender)
+                .expect_err("exclusive temp file")
+                .kind(),
+            io::ErrorKind::AlreadyExists,
+        );
+        assert_eq!(
+            fs::read(&partial).expect("untouched partial"),
+            b"another backup"
+        );
+        fs::remove_file(&partial).expect("remove test partial");
+
+        spec.device.capacity += 512;
+        assert_eq!(
+            backup(&spec, &cancel, &sender)
+                .expect_err("short source")
+                .kind(),
+            io::ErrorKind::UnexpectedEof,
+        );
+        assert_eq!(
+            fs::read(&image).expect("untouched image"),
+            b"previous image"
+        );
+        assert!(!partial.exists());
+        spec.device.capacity -= 512;
+
         let (bytes, hash) = backup(&spec, &cancel, &sender).expect("verified backup");
         assert_eq!(bytes, data.len() as u64);
         assert_eq!(hash.len(), 64);
         assert_eq!(fs::read(&image).expect("backup data"), data);
-        assert!(!partial_path(&image).exists());
+        assert!(!partial.exists());
         fs::remove_dir_all(directory).expect("cleanup test directory");
     }
 }

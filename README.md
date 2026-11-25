@@ -12,7 +12,7 @@ ALL ImgBackup es una aplicación de escritorio nativa para crear copias exactas 
 - Progreso, velocidad, tiempo restante y cancelación.
 - Detección nativa de dispositivos en Windows y Linux.
 - Identificación y bloqueo del disco que contiene el sistema.
-- Bloqueo y desmontaje automático de volúmenes en Windows antes de escribir.
+- Bloqueo y desmontaje automático de volúmenes en Windows antes de copiar o restaurar.
 - Impide usar como archivo de imagen el mismo dispositivo que se está procesando.
 - Escritura transaccional de backups mediante un archivo `.part`.
 - Detección de hardware en segundo plano para que la ventana nunca se bloquee.
@@ -47,11 +47,12 @@ En Linux, las particiones del destino deben estar desmontadas antes de restaurar
 ## Seguridad de escritura
 
 - El disco que contiene el sistema operativo aparece marcado y no se puede seleccionar.
-- Una restauración exige escribir `BORRAR` después de revisar modelo, capacidad y ruta física.
+- Antes de restaurar, el diálogo muestra el modelo, la capacidad y la ruta física. Pulsa «Sí» para continuar o «No» para cancelar. La aplicación vuelve a comprobar el dispositivo antes de escribir.
 - Windows bloquea y desmonta las letras de unidad asociadas al disco durante la operación.
 - Linux rechaza una restauración mientras alguna partición del destino siga montada.
 - Una imagen no puede almacenarse ni leerse desde el mismo dispositivo que actúa como origen/destino.
-- Al crear un backup se escribe primero `archivo.img.part`; el nombre final sólo aparece después de completar la copia y, si está activada, su verificación.
+- Los backups leen bloques de hasta 512 KiB. Si hay un error transitorio de lectura, se reintenta el mismo punto con bloques más pequeños.
+- Cada backup se guarda primero en `archivo.img.part`. Una imagen anterior sólo se reemplaza después de completar la copia y, si está activada, su verificación. El programa conserva cualquier `.part` que ya existiera al empezar.
 
 ## Desarrollo
 

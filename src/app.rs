@@ -70,8 +70,7 @@ pub struct AllImgBackupApp {
     notice: Option<(String, bool)>,
     active_job: Option<ActiveJob>,
     activity: Vec<ActivityEntry>,
-    restore_confirmation: bool,
-    confirmation_text: String,
+    restore_confirmation: Option<JobSpec>,
 }
 
 impl AllImgBackupApp {
@@ -89,8 +88,7 @@ impl AllImgBackupApp {
             notice: None,
             active_job: None,
             activity: Vec::new(),
-            restore_confirmation: false,
-            confirmation_text: String::new(),
+            restore_confirmation: None,
         };
         app.refresh_devices();
         app
@@ -186,7 +184,7 @@ impl AllImgBackupApp {
             .image_path
             .clone()
             .ok_or_else(|| "Selecciona la ruta del archivo de imagen.".to_string())?;
-        if path_is_on_device(&image, &device) {
+        if imaging::path_is_on_device(&image, &device) {
             return Err(
                 "El archivo de imagen no puede estar en el mismo dispositivo seleccionado.".into(),
             );
@@ -223,41 +221,44 @@ impl AllImgBackupApp {
     }
 
     fn request_start(&mut self, kind: JobKind) {
-        match self.validate(kind) {
-            Ok(_) if kind == JobKind::Restore => {
-                self.confirmation_text.clear();
-                self.restore_confirmation = true;
+        let (device, image) = match self.validate(kind) {
+            Ok(selection) => selection,
+            Err(message) => {
+                self.notice = Some((message, false));
+                return;
             }
-            Ok(_) => self.start_job(kind),
-            Err(message) => self.notice = Some((message, false)),
+        };
+        let spec = JobSpec {
+            kind,
+            device,
+            image,
+            verify: self.verify,
+        };
+        if kind == JobKind::Restore {
+            self.restore_confirmation = Some(spec);
+        } else {
+            self.start_job(spec);
         }
     }
 
-    fn start_job(&mut self, kind: JobKind) {
-        let Ok((device, image)) = self.validate(kind) else {
+    fn start_job(&mut self, spec: JobSpec) {
+        if self.active_job.is_some() {
             return;
-        };
+        }
+        let kind = spec.kind;
+        let device_name = spec.device.name.clone();
         let total = if kind == JobKind::Backup {
-            device.capacity
+            spec.device.capacity
         } else {
-            imaging::image_size(&image).unwrap_or_default()
+            imaging::image_size(&spec.image).unwrap_or_default()
         };
         let (sender, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        imaging::spawn(
-            JobSpec {
-                kind,
-                device: device.clone(),
-                image,
-                verify: self.verify,
-            },
-            cancel.clone(),
-            sender,
-        );
+        imaging::spawn(spec, cancel.clone(), sender);
         self.notice = None;
         self.active_job = Some(ActiveJob {
             kind,
-            device_name: device.name,
+            device_name,
             receiver,
             cancel,
             stage: Stage::Preparing,
@@ -276,7 +277,9 @@ impl AllImgBackupApp {
                 match event {
                     JobEvent::Stage(stage) => {
                         job.stage = stage;
-                        job.processed = 0;
+                        if stage != Stage::Flushing {
+                            job.processed = 0;
+                        }
                         job.speed = 0.0;
                     }
                     JobEvent::Progress {
@@ -327,7 +330,7 @@ impl AllImgBackupApp {
                 }
                 JobEvent::Cancelled => {
                     let message = if job.kind == JobKind::Backup {
-                        "Backup cancelado. El archivo parcial se ha eliminado."
+                        "Backup cancelado."
                     } else {
                         "Restauración cancelada. El dispositivo puede contener datos incompletos."
                     };
@@ -819,17 +822,11 @@ impl AllImgBackupApp {
     }
 
     fn confirm_window(&mut self, ctx: &egui::Context) {
-        if !self.restore_confirmation {
+        let Some(spec) = &self.restore_confirmation else {
             return;
-        }
-        let mut close = false;
-        let mut confirm = false;
-        egui::Window::new("Confirmar restauración")
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .collapsible(false)
-            .resizable(false)
-            .movable(false)
-            .title_bar(false)
+        };
+        let device = &spec.device;
+        let dialog = egui::Modal::new(egui::Id::new("confirm_restore"))
             .frame(
                 Frame::window(&ctx.global_style())
                     .fill(theme::SURFACE)
@@ -838,7 +835,7 @@ impl AllImgBackupApp {
                     .inner_margin(24),
             )
             .show(ctx, |ui| {
-                ui.set_width(480.0);
+                ui.set_width((ctx.content_rect().width() - 72.0).clamp(200.0, 460.0));
                 ui.horizontal(|ui| {
                     let (rect, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
                     paint_icon(
@@ -849,56 +846,50 @@ impl AllImgBackupApp {
                         2.2,
                     );
                     ui.label(
-                        RichText::new("Vas a sobrescribir un disco")
+                        RichText::new("Confirmar restauración")
                             .size(22.0)
                             .strong()
                             .color(theme::TEXT),
                     );
                 });
-                ui.add_space(8.0);
-                if let Some(device) = self.selected() {
-                    ui.label(
-                        RichText::new(format!(
-                            "Se eliminarán todos los datos de {} ({}, {}).",
-                            device.name,
-                            format_bytes(device.capacity),
-                            device.path
-                        ))
-                        .color(theme::MUTED),
-                    );
-                }
-                ui.add_space(16.0);
+                ui.add_space(12.0);
+                Frame::new()
+                    .fill(theme::SURFACE_2)
+                    .corner_radius(10)
+                    .inner_margin(12)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(&device.name).strong().color(theme::TEXT));
+                        ui.label(RichText::new(device.subtitle()).color(theme::MUTED));
+                        ui.label(RichText::new(&device.path).monospace().color(theme::MUTED));
+                    });
+                ui.add_space(14.0);
                 ui.label(
-                    RichText::new("Escribe BORRAR para confirmar:")
-                        .strong()
-                        .color(theme::TEXT),
+                    RichText::new(
+                        "¿Está seguro? El dispositivo será formateado y perderá todo su contenido.",
+                    )
+                    .strong()
+                    .color(theme::TEXT),
                 );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.confirmation_text)
-                        .hint_text("BORRAR")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Cancelar").clicked() {
-                        close = true;
-                    }
-                    let allowed = self.confirmation_text.trim() == "BORRAR";
-                    let button = egui::Button::new(RichText::new("Restaurar ahora").strong())
+                ui.add_space(18.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let yes = egui::Button::new(RichText::new("Sí").strong())
                         .fill(theme::RED)
-                        .corner_radius(10);
-                    if ui.add_enabled(allowed, button).clicked() {
-                        confirm = true;
-                    }
-                });
+                        .corner_radius(10)
+                        .min_size(Vec2::new(84.0, 34.0));
+                    let confirm = ui.add(yes).clicked();
+                    let close = ui
+                        .add(egui::Button::new("No").min_size(Vec2::new(84.0, 34.0)))
+                        .clicked();
+                    (confirm, close)
+                })
+                .inner
             });
-        if close {
-            self.restore_confirmation = false;
-            self.confirmation_text.clear();
-        }
-        if confirm {
-            self.restore_confirmation = false;
-            self.start_job(JobKind::Restore);
+        let (confirm, close) = dialog.inner;
+        if close || dialog.should_close() {
+            self.restore_confirmation = None;
+        } else if confirm && let Some(spec) = self.restore_confirmation.take() {
+            self.start_job(spec);
         }
     }
 }
@@ -1515,6 +1506,7 @@ fn stage_title(stage: Stage, kind: JobKind) -> &'static str {
         Stage::Copying if kind == JobKind::Backup => "Creando la imagen…",
         Stage::Copying => "Restaurando la imagen…",
         Stage::Verifying => "Verificando el resultado…",
+        Stage::Flushing if kind == JobKind::Backup => "Guardando la imagen…",
         Stage::Flushing => "Sincronizando el dispositivo…",
     }
 }
@@ -1544,25 +1536,4 @@ fn format_duration(duration: Duration) -> String {
     } else {
         format!("{} h {:02} min", seconds / 3600, (seconds % 3600) / 60)
     }
-}
-
-fn path_is_on_device(path: &Path, device: &DeviceInfo) -> bool {
-    let parent = path.parent().unwrap_or(path);
-    let normalized_parent = parent
-        .canonicalize()
-        .unwrap_or_else(|_| parent.to_path_buf());
-    device.mount_points.iter().any(|mount| {
-        let mount_path = Path::new(mount);
-        let normalized_mount = mount_path
-            .canonicalize()
-            .unwrap_or_else(|_| mount_path.to_path_buf());
-        if cfg!(windows) {
-            normalized_parent
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .starts_with(&normalized_mount.to_string_lossy().to_ascii_lowercase())
-        } else {
-            normalized_parent.starts_with(normalized_mount)
-        }
-    })
 }

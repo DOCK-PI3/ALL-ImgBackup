@@ -1,21 +1,28 @@
 use super::DeviceInfo;
 use std::{ffi::c_void, io, mem, ptr};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
     Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
     System::{
         IO::DeviceIoControl,
         Ioctl::{
-            IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_GET_HOTPLUG_INFO,
-            IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR,
-            STORAGE_HOTPLUG_INFO, STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
+            DISK_GEOMETRY_EX, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_GET_LENGTH_INFO,
+            IOCTL_STORAGE_GET_HOTPLUG_INFO, IOCTL_STORAGE_QUERY_PROPERTY,
+            IOCTL_STORAGE_READ_CAPACITY, PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR,
+            STORAGE_HOTPLUG_INFO, STORAGE_PROPERTY_QUERY, STORAGE_READ_CAPACITY,
+            StorageDeviceProperty,
         },
     },
 };
 
 pub fn scan() -> io::Result<Vec<DeviceInfo>> {
     let mut devices = Vec::new();
-    let system_disk = system_physical_drive();
+    let system_disk = system_physical_drive().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("no se pudo identificar el disco del sistema ({error})"),
+        )
+    })?;
 
     for index in 0..64 {
         let path = format!(r"\\.\PhysicalDrive{index}");
@@ -47,7 +54,7 @@ pub fn scan() -> io::Result<Vec<DeviceInfo>> {
             bus: descriptor.bus,
             capacity,
             removable: descriptor.removable || hotplug,
-            system: system_disk == Some(index),
+            system: system_disk == index,
             mounted: !mount_points.is_empty(),
             mount_points,
         });
@@ -112,8 +119,21 @@ fn disk_length(handle: HANDLE) -> io::Result<u64> {
     struct LengthInformation {
         length: i64,
     }
-    let value: LengthInformation = ioctl(handle, IOCTL_DISK_GET_LENGTH_INFO, ptr::null(), 0)?;
-    Ok(value.length.max(0) as u64)
+    if let Ok(value) =
+        ioctl::<LengthInformation>(handle, IOCTL_DISK_GET_LENGTH_INFO, ptr::null(), 0)
+        && value.length > 0
+    {
+        return Ok(value.length as u64);
+    }
+    if let Ok(geometry) =
+        ioctl::<DISK_GEOMETRY_EX>(handle, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, ptr::null(), 0)
+        && geometry.DiskSize > 0
+    {
+        return Ok(geometry.DiskSize as u64);
+    }
+    let capacity: STORAGE_READ_CAPACITY =
+        ioctl(handle, IOCTL_STORAGE_READ_CAPACITY, ptr::null(), 0)?;
+    Ok(capacity.DiskLength.max(0) as u64)
 }
 
 #[derive(Default)]
@@ -192,29 +212,15 @@ fn bus_name(value: i32) -> String {
     .into()
 }
 
-fn system_physical_drive() -> Option<u32> {
+fn system_physical_drive() -> io::Result<u32> {
     // Consultar el volumen del sistema evita identificar el disco por heurísticas de tamaño/modelo.
     let root = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
     let volume = format!(r"\\.\{}", root.trim_end_matches('\\'));
-    let path = wide(&volume);
-    let handle = unsafe {
-        CreateFileW(
-            path.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            ptr::null(),
-            OPEN_EXISTING,
-            0,
-            ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
-
+    let handle = open_query(&volume)?;
     let result = volume_disk_number(handle);
+    // open_query returned a valid handle that this function owns.
     unsafe { CloseHandle(handle) };
-    result.ok()
+    result
 }
 
 #[repr(C)]
@@ -235,6 +241,11 @@ struct VolumeExtents {
 fn volume_disk_number(handle: HANDLE) -> io::Result<u32> {
     const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x00560000;
     let value: VolumeExtents = ioctl(handle, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, ptr::null(), 0)?;
+    if value.count != 1 {
+        return Err(io::Error::other(
+            "el volumen no corresponde a un solo disco físico",
+        ));
+    }
     Ok(value.extent.disk_number)
 }
 
